@@ -179,6 +179,39 @@ for ligand_file in *.mol2; do
         show { print }
     ' "${TOPOL_DIR}/${lig_name}_fix_GMX.itp" > "${TOPOL_DIR}/${lig_name}_atomtypes.itp"
 
+    # 2b. Add atomic numbers (at.num) to ligand atomtypes.
+    #     ACPYPE leaves this column out; without it, gmx hbond (2024+) finds no
+    #     donors/acceptors and gmx sasa has to guess radii. Does not change forces.
+    awk '
+        /^\[/                { print; next }
+        /^[[:space:]]*;name/ { print ";name   bond_type at.num   mass      charge   ptype  sigma         epsilon"; next }
+        /^[[:space:]]*;/     { print; next }
+        /^[[:space:]]*$/     { print; next }
+        {
+            line = $0; cmt = ""
+            i = index(line, ";")
+            if (i) { cmt = " " substr(line, i); line = substr(line, 1, i - 1) }
+            n = split(line, f, " ")
+            if (n != 7) { print; next }          # already has at.num, leave as is
+            m = f[3] + 0
+            if      (m > 0.9  && m < 1.1)  z = 1    # H
+            else if (m > 11.5 && m < 12.5) z = 6    # C
+            else if (m > 13.5 && m < 14.5) z = 7    # N
+            else if (m > 15.5 && m < 16.5) z = 8    # O
+            else if (m > 18.5 && m < 19.5) z = 9    # F
+            else if (m > 30.5 && m < 31.5) z = 15   # P
+            else if (m > 31.5 && m < 32.5) z = 16   # S
+            else if (m > 35   && m < 36)   z = 17   # Cl
+            else if (m > 79   && m < 80.5) z = 35   # Br
+            else if (m > 126  && m < 127.5) z = 53  # I
+            else { z = 0; print "WARNING: unknown mass " m " for atomtype " f[1] > "/dev/stderr" }
+            printf " %-6s %-6s %3d %10.5f %8.5f %3s %13.5e %13.5e%s\n", f[1], f[2], z, f[3], f[4], f[5], f[6], f[7], cmt
+        }
+    ' "${TOPOL_DIR}/${lig_name}_atomtypes.itp" > "${TOPOL_DIR}/temp_at.itp" \
+        && mv "${TOPOL_DIR}/temp_at.itp" "${TOPOL_DIR}/${lig_name}_atomtypes.itp"
+    echo "  -> Added atomic numbers to ${lig_name}_atomtypes.itp"
+
+
     # 3. Strip [ atomtypes ], [ defaults ], [ system ], and [ molecules ] out of the main ITP
     awk '
         /\[[[:space:]]*(atomtypes|defaults|system|molecules)[[:space:]]*\]/ { skip=1; next }
@@ -328,9 +361,91 @@ if not any("POSRES_LIG" in l for l in lines):
 
     echo "Run MD!"
     gmx grompp -f "${SCRIPTS}/md.mdp" -c "${EQU_DIR}/npt.gro" -t "${EQU_DIR}/npt.cpt" -p "${TOPOL_TOP}" -o ./md.tpr
-    gmx mdrun -deffnm ./md -update cpu -ntomp 8
+    gmx mdrun -deffnm ./md -update cpu -pin on -ntomp 8
     cd "${LIGAND}"
 
+    ###############################################################
+    #------------------------5. analyze MDS-----------------------#
+    ###############################################################
+    MA_DIR="${SYSTEM_DIR}/07.md_analyze"
+    MD_CENTER="${MA_DIR}/CENTER"
+    MD_RMSD="${MA_DIR}/RMSD"
+    MD_RMSF="${MA_DIR}/RMSF"
+    MD_GYR="${MA_DIR}/GYRATE"
+    MD_SASA="${MA_DIR}/SASA"
+    MD_HBOND="${MA_DIR}/HBOND"
+    # Ligand residue name, read from the ligand .gro (column 6-10 of first atom line)
+    LIG_NAME=$(sed -n '3p' "${TOPOL_DIR}/unl.gro" | cut -c6-10 | tr -d ' ')
+
+
+    mkdir -p "${MA_DIR}" "${MD_CENTER}" "${MD_RMSD}" "${MD_RMSF}" "${MD_GYR}" "${MD_SASA}" "${MD_HBOND}"
+    # Make molecules whole and center the protein
+    printf "Protein\nSystem\n"  |gmx trjconv -s "${MD_DIR}/md.tpr" -f "${MD_DIR}/md.xtc" -o "${MD_CENTER}/md_noPBC.xtc"\
+    -pbc mol -center
+    # When prompted: choose "Protein" for centering, "System" for output
+
+    # Optional: remove rotation/translation (nicer for visualization)
+    printf "Backbone\nSystem\n" | gmx trjconv -s "${MD_DIR}/md.tpr" -f "${MD_CENTER}/md_noPBC.xtc" -o "${MD_CENTER}/md_fit.xtc" -fit rot+trans
+    # Choose "Backbone" for fitting, "System" (or "Protein") for output
+
+    printf "Backbone\nBackbone\n" | gmx rms -s "${MD_DIR}/md.tpr" -f "${MD_CENTER}/md_noPBC.xtc" -o "${MD_RMSD}/rmsd.xvg" -tu ns
+    # Group for least-squares fit: Backbone
+    # Group for RMSD calculation: Backbone
+
+    # RMSF: per-residue flexibility
+    echo "C-alpha" | gmx rmsf -s "${MD_DIR}/md.tpr" -f "${MD_CENTER}/md_noPBC.xtc" -o "${MD_RMSF}/rmsf.xvg" -res        # choose C-alpha
+
+    # Radius of gyration: compactness
+    gmx gyrate -s "${MD_DIR}/md.tpr" -f "${MD_CENTER}/md_noPBC.xtc" -sel "group Protein" -o "${MD_GYR}/gyrate.xvg" -tu ns
+          # choose Protein
+
+    # SASA: solvent-accessible surface area
+    echo "Protein" | gmx sasa -s "${MD_DIR}/md.tpr" -f "${MD_CENTER}/md_noPBC.xtc" -o "${MD_SASA}/sasa.xvg" -tu ns       # choose Protein
+
+    # Hydrogen bonds (protein–ligand)
+    if grep -q "${LIG_NAME}" "${MD_DIR}/md.gro" 2>/dev/null; then
+        # "|| echo" so a failed H-bond step does not stop plotting and the next ligands (set -e)
+        gmx hbond -s "${MD_DIR}/md.tpr" -f "${MD_CENTER}/md_noPBC.xtc" -r "group Protein" -t "resname ${LIG_NAME}" \
+            -num "${MD_HBOND}/hbnum.xvg" -tu ns \
+            || echo "  -> WARNING: gmx hbond failed for ${lig_name}, skipping H-bond analysis"
+    fi
+
+
+# Plot all .xvg to PNG
+( cd "${MA_DIR}" && python3 - <<'EOF'
+import os
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# (file, x label, y label)
+plots = {
+    "RMSD/rmsd.xvg":    ("Time (ns)", "RMSD (nm)"),
+    "RMSF/rmsf.xvg":    ("Residue",   "RMSF (nm)"),
+    "GYRATE/gyrate.xvg":("Time (ns)", "Rg (nm)"),
+    "SASA/sasa.xvg":    ("Time (ns)", "SASA (nm$^2$)"),
+    "HBOND/hbnum.xvg":  ("Time (ns)", "Number of H-bonds"),
+}
+
+def load_xvg(fname):
+    data = np.loadtxt(fname, comments=("#", "@"))
+    return data[:, 0], data[:, 1]
+
+for fname, (xlab, ylab) in plots.items():
+    if not os.path.exists(fname):
+        print(f"skip: {fname} not found")
+        continue
+    x, y = load_xvg(fname)
+    plt.figure(figsize=(6, 3.5))
+    plt.plot(x, y, lw=1)
+    plt.xlabel(xlab)
+    plt.ylabel(ylab)
+    plt.tight_layout()
+    plt.savefig(fname.replace(".xvg", ".png"), dpi=1200)
+    plt.close()
+EOF
+)
 done
 
 echo "Script complete! Directory tree and topologies generated successfully."
